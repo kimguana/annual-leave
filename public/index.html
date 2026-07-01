@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>사내 연차 관리</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <h1>사내 연차 관리</h1>
+      <div class="year-nav">
+        <button id="year-prev" class="year-btn" title="이전 연도">◀</button>
+        <span id="year-label">연도</span>
+        <button id="year-next" class="year-btn" title="다음 연도">▶</button>
+      </div>
+      <nav class="tabs">
+        <button data-view="dashboard" class="tab active">대시보드</button>
+        <button data-view="usage" class="tab">연차 사용</button>
+        <button data-view="report" class="tab">보고서</button>
+        <button data-view="employees" class="tab">직원 관리</button>
+        <button data-view="settlement" class="tab">퇴사 정산</button>
+      </nav>
+      <span id="save-status" class="save-status"></span>
+    </aside>
+    <main>
+      <section id="view-dashboard" class="view active"></section>
+      <section id="view-usage" class="view"></section>
+      <section id="view-report" class="view"></section>
+      <section id="view-employees" class="view"></section>
+      <section id="view-settlement" class="view"></section>
+    </main>
+  </div>
+  <script src="/vendor/exceljs.min.js"></script>
+  <script src="/leave-logic.js"></script>
+  <script src="/holidays.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
