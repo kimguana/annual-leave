@@ -3,6 +3,8 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
+const zlib = require('zlib');
+const LeaveLogic = require('./public/leave-logic.js');
 const Holidays = require('./public/holidays.js'); // 오프라인 폴백용 내장 공휴일 표
 
 const PORT = 4173;
@@ -137,6 +139,348 @@ async function getHolidays(year) {
   }
 }
 
+function excelCellText(cell) {
+  try {
+    return String(cell.text || '').trim();
+  } catch (e) {
+    const v = cell.value;
+    if (v === null || v === undefined) {
+      return '';
+    }
+    if (v instanceof Date) {
+      return LeaveLogic.todayStr(v);
+    }
+    if (typeof v === 'object' && v.result !== undefined) {
+      return String(v.result).trim();
+    }
+    return String(v).trim();
+  }
+}
+
+function excelCellDate(cell) {
+  const v = cell.value;
+  return v instanceof Date ? LeaveLogic.todayStr(v) : null;
+}
+
+function usageDaysFromExcelCell(cell) {
+  const v = cell.value;
+  let n = null;
+  if (typeof v === 'number') {
+    n = v;
+  } else if (v && typeof v === 'object' && typeof v.result === 'number') {
+    n = v.result;
+  } else {
+    const text = excelCellText(cell);
+    if (/^\d+(\.\d+)?$/.test(text)) {
+      n = parseFloat(text);
+    } else if (text.includes('반반차')) {
+      n = 0.25;
+    } else if (text.includes('반차')) {
+      n = 0.5;
+    } else if (text.includes('연차') || text.includes('병가')) {
+      n = 1;
+    }
+  }
+  if (!Number.isFinite(n) || n <= 0) {
+    return 0;
+  }
+  return Math.round(n * 100) / 100;
+}
+
+async function parseUsageWorkbook(buffer, year, asOfMonth) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buffer);
+  const yy = String(year).slice(-2);
+  const ws = wb.getWorksheet(`20 (${yy}).`);
+  if (!ws) {
+    throw new Error(`20 (${yy}). sheet not found`);
+  }
+
+  const dateCols = [];
+  ws.getRow(5).eachCell((cell, col) => {
+    const date = excelCellDate(cell);
+    if (date && date.startsWith(year + '-')) {
+      dateCols.push({ col, date });
+    }
+  });
+
+  const records = [];
+  let rowNum = 1;
+  while (rowNum <= ws.rowCount) {
+    const employeeName = excelCellText(ws.getRow(rowNum).getCell(5));
+    const joinDate = LeaveLogic.parseImportDate(ws.getRow(rowNum + 1).getCell(5).value);
+    const usageLabel = excelCellText(ws.getRow(rowNum + 2).getCell(5));
+    if (!employeeName || !joinDate || usageLabel !== '사용') {
+      rowNum += 1;
+      continue;
+    }
+
+    dateCols.forEach(({ col, date }) => {
+      const cell = ws.getRow(rowNum + 2).getCell(col);
+      const days = usageDaysFromExcelCell(cell);
+      if (!days) {
+        return;
+      }
+      const noteText = excelCellText(cell);
+      records.push({
+        employeeName,
+        date,
+        days,
+        note: noteText && !/^\d+(\.\d+)?$/.test(noteText) ? noteText : '',
+      });
+    });
+    rowNum += 4;
+  }
+  return { records };
+}
+
+function xmlDecode(s) {
+  return String(s || '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
+function xmlAttr(attrs, name) {
+  const m = attrs.match(new RegExp('(?:^|\\s)' + name + '="([^"]*)"'));
+  return m ? xmlDecode(m[1]) : '';
+}
+
+function colNameToNumber(name) {
+  let n = 0;
+  for (const ch of name) {
+    n = n * 26 + (ch.charCodeAt(0) - 64);
+  }
+  return n;
+}
+
+function excelSerialToDate(serial) {
+  const days = Math.floor(Number(serial));
+  if (!Number.isFinite(days)) {
+    return null;
+  }
+  return LeaveLogic.todayStr(new Date(Date.UTC(1899, 11, 30) + days * 86400000));
+}
+
+function zipEntries(buffer) {
+  let eocd = -1;
+  for (let i = buffer.length - 22; i >= 0; i -= 1) {
+    if (buffer.readUInt32LE(i) === 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  }
+  if (eocd < 0) {
+    throw new Error('invalid xlsx zip');
+  }
+  const count = buffer.readUInt16LE(eocd + 10);
+  let ptr = buffer.readUInt32LE(eocd + 16);
+  const entries = {};
+  for (let i = 0; i < count; i += 1) {
+    if (buffer.readUInt32LE(ptr) !== 0x02014b50) {
+      throw new Error('invalid xlsx central directory');
+    }
+    const method = buffer.readUInt16LE(ptr + 10);
+    const compressedSize = buffer.readUInt32LE(ptr + 20);
+    const nameLen = buffer.readUInt16LE(ptr + 28);
+    const extraLen = buffer.readUInt16LE(ptr + 30);
+    const commentLen = buffer.readUInt16LE(ptr + 32);
+    const localOffset = buffer.readUInt32LE(ptr + 42);
+    const name = buffer.toString('utf8', ptr + 46, ptr + 46 + nameLen);
+    entries[name] = { method, compressedSize, localOffset };
+    ptr += 46 + nameLen + extraLen + commentLen;
+  }
+  return {
+    read(name) {
+      const entry = entries[name];
+      if (!entry) {
+        return null;
+      }
+      const local = entry.localOffset;
+      if (buffer.readUInt32LE(local) !== 0x04034b50) {
+        throw new Error('invalid xlsx local file header');
+      }
+      const nameLen = buffer.readUInt16LE(local + 26);
+      const extraLen = buffer.readUInt16LE(local + 28);
+      const start = local + 30 + nameLen + extraLen;
+      const compressed = buffer.subarray(start, start + entry.compressedSize);
+      if (entry.method === 0) {
+        return compressed;
+      }
+      if (entry.method === 8) {
+        return zlib.inflateRawSync(compressed);
+      }
+      throw new Error('unsupported xlsx compression method ' + entry.method);
+    },
+  };
+}
+
+function readZipText(zip, name) {
+  const data = zip.read(name);
+  return data ? data.toString('utf8') : '';
+}
+
+function parseSharedStrings(xml) {
+  const strings = [];
+  const siRegex = /<si\b[\s\S]*?<\/si>/g;
+  let si;
+  while ((si = siRegex.exec(xml))) {
+    let text = '';
+    const tRegex = /<t\b[^>]*>([\s\S]*?)<\/t>/g;
+    let t;
+    while ((t = tRegex.exec(si[0]))) {
+      text += xmlDecode(t[1]);
+    }
+    strings.push(text);
+  }
+  return strings;
+}
+
+function findSheetPath(zip, sheetName) {
+  const workbook = readZipText(zip, 'xl/workbook.xml');
+  const rels = readZipText(zip, 'xl/_rels/workbook.xml.rels');
+  const relMap = {};
+  const relRegex = /<Relationship\b([^>]*)\/>/g;
+  let rel;
+  while ((rel = relRegex.exec(rels))) {
+    const id = xmlAttr(rel[1], 'Id');
+    let target = xmlAttr(rel[1], 'Target');
+    target = target.startsWith('/') ? target.slice(1) : 'xl/' + target.replace(/^xl\//, '');
+    relMap[id] = target;
+  }
+
+  const sheetRegex = /<sheet\b([^>]*)\/>/g;
+  let sheet;
+  while ((sheet = sheetRegex.exec(workbook))) {
+    if (xmlAttr(sheet[1], 'name') === sheetName) {
+      return relMap[xmlAttr(sheet[1], 'r:id')];
+    }
+  }
+  return null;
+}
+
+function parseSheetRows(xml, sharedStrings) {
+  const rows = {};
+  const rowRegex = /<row\b([^>]*)>([\s\S]*?)<\/row>/g;
+  let rowMatch;
+  while ((rowMatch = rowRegex.exec(xml))) {
+    const rowNum = parseInt(xmlAttr(rowMatch[1], 'r'), 10);
+    if (!rowNum) {
+      continue;
+    }
+    const cells = {};
+    const cellRegex = /<c\b([^>]*?)(?:\/>|>([\s\S]*?)<\/c>)/g;
+    let cellMatch;
+    while ((cellMatch = cellRegex.exec(rowMatch[2]))) {
+      const attrs = cellMatch[1];
+      const body = cellMatch[2] || '';
+      const ref = xmlAttr(attrs, 'r');
+      const refMatch = ref.match(/^([A-Z]+)/);
+      if (!refMatch) {
+        continue;
+      }
+      const col = colNameToNumber(refMatch[1]);
+      const type = xmlAttr(attrs, 't');
+      let value = '';
+      if (type === 's') {
+        const m = body.match(/<v>([\s\S]*?)<\/v>/);
+        value = sharedStrings[parseInt(m ? m[1] : '', 10)] || '';
+      } else if (type === 'inlineStr') {
+        const m = body.match(/<t\b[^>]*>([\s\S]*?)<\/t>/);
+        value = m ? xmlDecode(m[1]) : '';
+      } else {
+        const m = body.match(/<v>([\s\S]*?)<\/v>/);
+        value = m ? xmlDecode(m[1]) : '';
+      }
+      cells[col] = String(value).trim();
+    }
+    rows[rowNum] = cells;
+  }
+  return rows;
+}
+
+function usageDaysFromText(text) {
+  let n = null;
+  if (/^\d+(\.\d+)?$/.test(text)) {
+    n = parseFloat(text);
+  } else {
+    const numericLine = String(text).split(/\s+/).find((part) => /^\d+(\.\d+)?$/.test(part));
+    if (numericLine) {
+      n = parseFloat(numericLine);
+    }
+  }
+  if (!Number.isFinite(n) && text.includes('반반차')) {
+    n = 0.25;
+  } else if (text.includes('반차')) {
+    n = 0.5;
+  } else if (text.includes('연차') || text.includes('병가')) {
+    n = 1;
+  }
+  if (!Number.isFinite(n) || n <= 0) {
+    return 0;
+  }
+  return Math.round(n * 100) / 100;
+}
+
+async function parseUsageWorkbook(buffer, year) {
+  const zip = zipEntries(buffer);
+  const yy = String(year).slice(-2);
+  const sheetPath = findSheetPath(zip, `20 (${yy}).`);
+  if (!sheetPath) {
+    throw new Error(`20 (${yy}). sheet not found`);
+  }
+  const sharedStrings = parseSharedStrings(readZipText(zip, 'xl/sharedStrings.xml'));
+  const rows = parseSheetRows(readZipText(zip, sheetPath), sharedStrings);
+
+  const dateCols = [];
+  const dateRow = rows[5] || {};
+  for (const [colText, raw] of Object.entries(dateRow)) {
+    const date = excelSerialToDate(raw);
+    if (date && date.startsWith(year + '-')) {
+      dateCols.push({ col: parseInt(colText, 10), date });
+    }
+  }
+
+  const records = [];
+  let rowNum = 1;
+  while (rowNum <= 2000) {
+    const row = rows[rowNum] || {};
+    const nextRow = rows[rowNum + 1] || {};
+    const usageRow = rows[rowNum + 2] || {};
+    const employeeName = (row[5] || '').trim();
+    const joinDate = LeaveLogic.parseImportDate(nextRow[5]) || excelSerialToDate(nextRow[5]);
+    const usageLabel = (usageRow[5] || '').trim();
+    if (!employeeName && !joinDate && !usageLabel && rowNum > 100) {
+      break;
+    }
+    if (!employeeName || !joinDate || usageLabel !== '사용') {
+      rowNum += 1;
+      continue;
+    }
+
+    for (const { col, date } of dateCols) {
+      const text = (usageRow[col] || '').trim();
+      if (!text) {
+        continue;
+      }
+      const days = usageDaysFromText(text);
+      if (!days) {
+        continue;
+      }
+      records.push({
+        employeeName,
+        date,
+        days,
+        note: /^\d+(\.\d+)?$/.test(text) ? '' : text,
+      });
+    }
+    rowNum += 4;
+  }
+  return { records };
+}
+
 const server = http.createServer((req, res) => {
   if (req.url === '/api/version' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': MIME['.json'] });
@@ -158,6 +502,31 @@ const server = http.createServer((req, res) => {
   if (req.url === '/api/data' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': MIME['.json'] });
     res.end(readData());
+    return;
+  }
+  if (req.url.startsWith('/api/import/usages') && req.method === 'POST') {
+    const url = new URL(req.url, 'http://localhost');
+    const year = parseInt(url.searchParams.get('year'), 10)
+      || new Date().getFullYear();
+    const chunks = [];
+    let size = 0;
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > 30 * 1024 * 1024) {
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      parseUsageWorkbook(Buffer.concat(chunks), year).then((result) => {
+        res.writeHead(200, { 'Content-Type': MIME['.json'] });
+        res.end(JSON.stringify(result));
+      }).catch((e) => {
+        res.writeHead(400, { 'Content-Type': MIME['.json'] });
+        res.end(JSON.stringify({ ok: false, error: e.message }));
+      });
+    });
     return;
   }
   if (req.url === '/api/data' && req.method === 'POST') {
@@ -182,6 +551,8 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => {
   const url = 'http://localhost:' + PORT;
   console.log('연차 관리 서버 실행 중: ' + url);
-  // 윈도우 기본 브라우저 자동 오픈
-  exec('start "" "' + url + '"');
+  // 일반 실행에서만 브라우저를 자동으로 열고, 개발 모드 재시작에서는 열지 않는다.
+  if (!DEV) {
+    exec('start "" "' + url + '"');
+  }
 });

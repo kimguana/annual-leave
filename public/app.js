@@ -212,12 +212,175 @@
     });
 
     // 엑셀 시트에서 직원 목록을 파싱한다(이미지 양식: 직원=열, 라벨=1열).
+    function safeCellText(cell) {
+      try {
+        return String(cell.text || '').trim();
+      } catch (e) {
+        const v = cell.value;
+        if (v === null || v === undefined) {
+          return '';
+        }
+        if (v instanceof Date) {
+          return L.todayStr(v);
+        }
+        if (typeof v === 'object' && v.result !== undefined) {
+          return String(v.result).trim();
+        }
+        return String(v).trim();
+      }
+    }
+
+    function cellNumber(cell) {
+      const v = cell.value;
+      let n = 0;
+      if (typeof v === 'number') {
+        n = v;
+      } else if (v && typeof v === 'object' && typeof v.result === 'number') {
+        n = v.result;
+      } else {
+        n = parseFloat(safeCellText(cell));
+      }
+      return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0;
+    }
+
+    function selectImportWorksheet(wb) {
+      const yy = String(base).slice(-2);
+      const calculationSheet = wb.getWorksheet(`연차계산${yy}.06`);
+      if (calculationSheet) {
+        return calculationSheet;
+      }
+      const preferred = `20 (${yy}).`;
+      const preferredSheet = wb.getWorksheet(preferred);
+      if (preferredSheet) {
+        return preferredSheet;
+      }
+      const wanted = `20(${yy})`;
+      const normalize = (name) => String(name || '').replace(/[\s.]/g, '');
+      return wb.worksheets.find((ws) => normalize(ws.name) === wanted) || wb.worksheets[0];
+    }
+
+    function findRowByLabel(ws, label) {
+      let found = null;
+      ws.eachRow((row) => {
+        if (found) {
+          return;
+        }
+        row.eachCell((cell) => {
+          if (found) {
+            return;
+          }
+          if (safeCellText(cell).replace(/\s/g, '').includes(label)) {
+            found = row;
+          }
+        });
+      });
+      return found;
+    }
+
+    function parseCalculationEmployeeSheet(ws) {
+      const joinRow = findRowByLabel(ws, '입사일');
+      const nameRow = findRowByLabel(ws, '이름');
+      const balanceRow = findRowByLabel(ws, `${base}년보유연차`);
+      if (!joinRow || !nameRow || !balanceRow) {
+        return [];
+      }
+
+      const employees = [];
+      nameRow.eachCell((cell, col) => {
+        const name = safeCellText(cell);
+        const joinDate = L.parseImportDate(joinRow.getCell(col).value);
+        if (!name || name === '이름' || !joinDate) {
+          return;
+        }
+        employees.push({
+          name,
+          joinDate,
+          initialBalance: cellNumber(balanceRow.getCell(col)),
+          forceInitialBalance: true,
+          valid: true,
+        });
+      });
+      return employees;
+    }
+
+    function parseRowBlockEmployeeSheet(ws) {
+      let balanceCol = 0;
+      const monthNeedle = `${base}.01`;
+      ws.getRow(4).eachCell((cell, col) => {
+        if (balanceCol) {
+          return;
+        }
+        const label = safeCellText(cell).replace(/\s/g, '');
+        if (label.includes(monthNeedle)) {
+          balanceCol = col;
+        }
+      });
+      if (!balanceCol) {
+        return [];
+      }
+
+      const employees = [];
+      let rowNum = 1;
+      while (rowNum <= ws.rowCount) {
+        const name = safeCellText(ws.getRow(rowNum).getCell(5));
+        if (!name || name === '사용' || name === '잔여' || /^\d{4}-\d{2}-\d{2}$/.test(name)) {
+          rowNum += 1;
+          continue;
+        }
+
+        let dateRowNum = 0;
+        let joinDate = null;
+        for (let offset = 1; offset <= 4; offset += 1) {
+          let sameBlock = true;
+          for (let between = 1; between < offset; between += 1) {
+            const betweenName = safeCellText(ws.getRow(rowNum + between).getCell(5));
+            if (betweenName && betweenName !== name) {
+              sameBlock = false;
+              break;
+            }
+          }
+          if (!sameBlock) {
+            continue;
+          }
+          const parsed = L.parseImportDate(ws.getRow(rowNum + offset).getCell(5).value);
+          if (parsed) {
+            dateRowNum = rowNum + offset;
+            joinDate = parsed;
+            break;
+          }
+        }
+        if (!joinDate) {
+          rowNum += 1;
+          continue;
+        }
+        if (safeCellText(ws.getRow(dateRowNum + 1).getCell(5)) !== '사용') {
+          rowNum += 1;
+          continue;
+        }
+
+        const initialBalance = cellNumber(ws.getRow(dateRowNum).getCell(balanceCol));
+        employees.push({ name, joinDate, initialBalance, valid: true });
+        rowNum = dateRowNum + 3;
+      }
+      return employees;
+    }
+
     function parseEmployeeSheet(ws) {
+      const calculationEmployees = parseCalculationEmployeeSheet(ws);
+      if (calculationEmployees.length > 0) {
+        return calculationEmployees;
+      }
+
+      const rowBlockEmployees = parseRowBlockEmployeeSheet(ws);
+      if (rowBlockEmployees.length > 0) {
+        return rowBlockEmployees;
+      }
+
       let joinRow = null;
       let nameRow = null;
       let nameRowNum = 0;
       ws.eachRow((row, rn) => {
-        const label = String(row.getCell(1).text || '').replace(/\s/g, '');
+        const label = safeCellText(row.getCell(1)).replace(/\s/g, '');
         if (!joinRow && label.includes('입사일')) {
           joinRow = row;
         }
@@ -232,7 +395,7 @@
       // 직원 열 = 이름 행에서 이름이 채워진 2열 이상 컬럼.
       const empCols = [];
       nameRow.eachCell((cell, col) => {
-        if (col >= 2 && String(cell.text || '').trim()) {
+        if (col >= 2 && safeCellText(cell)) {
           empCols.push(col);
         }
       });
@@ -245,19 +408,15 @@
         if (balanceRow || rn <= nameRowNum) {
           return;
         }
-        const hasNumber = empCols.some((c) => typeof row.getCell(c).value === 'number');
+        const hasNumber = empCols.some((c) => cellNumber(row.getCell(c)) !== 0);
         if (hasNumber) {
           balanceRow = row;
         }
       });
       return empCols.map((c) => {
-        const name = String(nameRow.getCell(c).text || '').trim();
+        const name = safeCellText(nameRow.getCell(c));
         const joinDate = L.parseImportDate(joinRow.getCell(c).value);
-        let initialBalance = 0;
-        if (balanceRow) {
-          const v = balanceRow.getCell(c).value;
-          initialBalance = (typeof v === 'number') ? v : (parseFloat(v) || 0);
-        }
+        const initialBalance = balanceRow ? cellNumber(balanceRow.getCell(c)) : 0;
         return { name, joinDate, initialBalance, valid: !!(name && joinDate) };
       });
     }
@@ -303,7 +462,7 @@
         // 입사연도가 운영 첫해 이후면 초기잔액은 자동(0) — 수동 추가와 동일 규칙.
         App.state.employees = valids.map((x) => {
           const joinYear = new Date(x.joinDate).getFullYear();
-          const initialBalance = (joinYear < base) ? x.initialBalance : 0;
+          const initialBalance = x.forceInitialBalance ? x.initialBalance : ((joinYear < base) ? x.initialBalance : 0);
           // 이름이 같은 기존 직원이 있으면 그 색을 유지, 신규는 기본 보라색.
           const existing = existingByName[x.name];
           const color = existing ? empColor(existing) : DEFAULT_COLOR;
@@ -318,7 +477,9 @@
 
     // 버튼 클릭 시 숨긴 파일 입력을 연다.
     el.querySelector('#emp-import-btn').addEventListener('click', () => {
-      el.querySelector('#emp-import').click();
+      const input = el.querySelector('#emp-import');
+      input.value = '';
+      input.click();
     });
 
     // 엑셀 파일 선택 시 파싱 후 미리보기.
@@ -327,17 +488,19 @@
       if (!file) {
         return;
       }
+      el.querySelector('#import-preview').innerHTML = '<div class="loading-box"><span class="spinner"></span><span>엑셀을 읽는 중입니다.</span></div>';
       const reader = new FileReader();
       reader.onload = async () => {
         try {
           const wb = new ExcelJS.Workbook();
           await wb.xlsx.load(reader.result);
-          const ws = wb.worksheets[0];
+          const ws = selectImportWorksheet(wb);
           if (!ws) {
             throw new Error('시트를 찾을 수 없습니다.');
           }
           renderImportPreview(parseEmployeeSheet(ws));
         } catch (e) {
+          el.querySelector('#import-preview').innerHTML = '';
           alert('엑셀을 읽지 못했습니다: ' + e.message);
         }
       };
@@ -436,7 +599,12 @@
     App._usageHighlight = null;
 
     el.innerHTML = `
-      <h2>연차 사용 입력</h2>
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <h2>연차 사용 입력</h2>
+        <button class="action" id="usage-import-btn">엑셀 가져오기</button>
+      </div>
+      <input id="usage-import" type="file" accept=".xlsx" style="display:none" />
+      <div id="usage-import-preview"></div>
       <div class="row">
         <select id="u-emp">${options || '<option>직원 없음</option>'}</select>
         <input id="u-date" type="date" value="${defDate}" />
@@ -492,6 +660,166 @@
       });
     }
 
+    function usageCellText(cell) {
+      try {
+        return String(cell.text || '').trim();
+      } catch (e) {
+        const v = cell.value;
+        if (v === null || v === undefined) {
+          return '';
+        }
+        if (v instanceof Date) {
+          return L.todayStr(v);
+        }
+        if (typeof v === 'object' && v.result !== undefined) {
+          return String(v.result).trim();
+        }
+        return String(v).trim();
+      }
+    }
+
+    function usageCellDate(cell) {
+      const v = cell.value;
+      return v instanceof Date ? L.todayStr(v) : null;
+    }
+
+    function usageDaysFromCell(cell) {
+      const v = cell.value;
+      let n = null;
+      if (typeof v === 'number') {
+        n = v;
+      } else if (v && typeof v === 'object' && typeof v.result === 'number') {
+        n = v.result;
+      } else {
+        const text = usageCellText(cell);
+        if (/^\d+(\.\d+)?$/.test(text)) {
+          n = parseFloat(text);
+        } else if (text.includes('반반차')) {
+          n = 0.25;
+        } else if (text.includes('반차')) {
+          n = 0.5;
+        } else if (text.includes('연차') || text.includes('병가')) {
+          n = 1;
+        }
+      }
+      if (!Number.isFinite(n) || n <= 0) {
+        return 0;
+      }
+      return Math.round(n * 100) / 100;
+    }
+
+    function parseUsageImportSheet(ws) {
+      const empByName = {};
+      App.state.employees.forEach((e) => { empByName[e.name] = e; });
+
+      const dateCols = [];
+      ws.getRow(5).eachCell((cell, col) => {
+        const date = usageCellDate(cell);
+        if (date && date.startsWith(App.year + '-')) {
+          dateCols.push({ col, date });
+        }
+      });
+
+      const imported = [];
+      const unmatched = [];
+      let rowNum = 1;
+      while (rowNum <= ws.rowCount) {
+        const name = usageCellText(ws.getRow(rowNum).getCell(5));
+        const joinDate = L.parseImportDate(ws.getRow(rowNum + 1).getCell(5).value);
+        const usageLabel = usageCellText(ws.getRow(rowNum + 2).getCell(5));
+        if (!name || !joinDate || usageLabel !== '사용') {
+          rowNum += 1;
+          continue;
+        }
+
+        const emp = empByName[name];
+        if (!emp) {
+          unmatched.push(name);
+          rowNum += 4;
+          continue;
+        }
+
+        dateCols.forEach(({ col, date }) => {
+          const cell = ws.getRow(rowNum + 2).getCell(col);
+          const days = usageDaysFromCell(cell);
+          if (!days) {
+            return;
+          }
+          const note = usageCellText(cell);
+          imported.push({
+            id: App.uid(),
+            employeeId: emp.id,
+            date,
+            days,
+            note: note && !/^\d+(\.\d+)?$/.test(note) ? note : '',
+            importName: emp.name,
+          });
+        });
+        rowNum += 4;
+      }
+      return { imported, unmatched: Array.from(new Set(unmatched)) };
+    }
+
+    function renderUsageImportPreview(result) {
+      const box = el.querySelector('#usage-import-preview');
+      const byName = {};
+      result.imported.forEach((u) => {
+        byName[u.importName] = (byName[u.importName] || 0) + u.days;
+      });
+      const rows = Object.keys(byName).sort((a, b) => a.localeCompare(b, 'ko'))
+        .map((name) => `<tr><td>${escapeHtml(name)}</td><td>${Math.round(byName[name] * 100) / 100}</td></tr>`)
+        .join('');
+      const detailRows = result.imported
+        .slice()
+        .sort((a, b) => a.importName.localeCompare(b.importName, 'ko') || a.date.localeCompare(b.date))
+        .map((u) => `<tr><td>${escapeHtml(u.importName)}</td><td>${u.date}</td><td>${u.days}</td><td>${escapeHtml(u.note || '')}</td></tr>`)
+        .join('');
+      const unmatched = result.unmatched.length
+        ? `<p style="color:#888; font-size:12px;">직원관리에서 찾지 못한 이름: ${escapeHtml(result.unmatched.join(', '))}</p>`
+        : '';
+      box.innerHTML = `
+        <div style="border:1px solid #3a6ea5; border-radius:8px; padding:12px; margin:10px 0; background:#fff;">
+          <h3>연차 사용 가져오기 미리보기 - 총 ${result.imported.length}건</h3>
+          <p style="color:#c0392b;">확인 시 엑셀에 입력된 사용기록 그대로 교체합니다.</p>
+          <table><thead><tr><th>이름</th><th>사용일수 합계</th></tr></thead><tbody>${rows || '<tr><td colspan="2">가져올 기록 없음</td></tr>'}</tbody></table>
+          <h4 style="margin:14px 0 6px;">상세 내역</h4>
+          <div style="max-height:280px; overflow:auto;">
+            <table><thead><tr><th>이름</th><th>날짜</th><th>일수</th><th>메모</th></tr></thead><tbody>${detailRows || '<tr><td colspan="4">가져올 기록 없음</td></tr>'}</tbody></table>
+          </div>
+          ${unmatched}
+          <div class="row" style="margin-top:10px;">
+            <button class="action" id="usage-import-confirm">확인(사용기록 교체)</button>
+            <button class="action" id="usage-import-cancel">취소</button>
+          </div>
+        </div>`;
+
+      box.querySelector('#usage-import-cancel').addEventListener('click', () => {
+        box.innerHTML = '';
+      });
+      box.querySelector('#usage-import-confirm').addEventListener('click', () => {
+        if (!result.imported.length) {
+          alert('가져올 사용기록이 없습니다.');
+          return;
+        }
+        if (!confirm(`${App.year}년 사용기록을 엑셀에 입력된 ${result.imported.length}건으로 교체할까요?`)) {
+          return;
+        }
+        const yearStart = App.year + '-01-01';
+        const nextYearStart = (App.year + 1) + '-01-01';
+        App.state.usages = App.state.usages
+          .filter((u) => u.date < yearStart || u.date >= nextYearStart)
+          .concat(result.imported.map((u) => ({
+            id: u.id,
+            employeeId: u.employeeId,
+            date: u.date,
+            days: u.days,
+            note: u.note,
+          })));
+        App.save();
+        App.renderAll();
+      });
+    }
+
     function showBalance() {
       const id = el.querySelector('#u-emp').value;
       const emp = App.state.employees.find((e) => e.id === id);
@@ -517,6 +845,55 @@
     el.querySelector('#u-date').addEventListener('change', showBalance);
     showBalance();
     renderRecords();
+
+    el.querySelector('#usage-import-btn').addEventListener('click', () => {
+      const input = el.querySelector('#usage-import');
+      input.value = '';
+      input.click();
+    });
+
+    el.querySelector('#usage-import').addEventListener('change', (ev) => {
+      const file = ev.target.files && ev.target.files[0];
+      if (!file) {
+        return;
+      }
+      el.querySelector('#usage-import-preview').innerHTML = '<div class="loading-box"><span class="spinner"></span><span>엑셀을 읽는 중입니다.</span></div>';
+      (async () => {
+        try {
+          const res = await fetch('/api/import/usages?year=' + App.year, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' },
+            body: file,
+          });
+          const parsed = await res.json();
+          if (!res.ok) {
+            throw new Error(parsed.error || 'server import failed');
+          }
+          const empByName = {};
+          App.state.employees.forEach((emp) => { empByName[emp.name] = emp; });
+          const unmatched = [];
+          const imported = parsed.records.map((record) => {
+            const emp = empByName[record.employeeName];
+            if (!emp) {
+              unmatched.push(record.employeeName);
+              return null;
+            }
+            return {
+              id: App.uid(),
+              employeeId: emp.id,
+              date: record.date,
+              days: record.days,
+              note: record.note || '',
+              importName: emp.name,
+            };
+          }).filter(Boolean);
+          renderUsageImportPreview({ imported, unmatched: Array.from(new Set(unmatched)) });
+        } catch (e) {
+          el.querySelector('#usage-import-preview').innerHTML = '';
+          alert('엑셀을 읽지 못했습니다: ' + e.message);
+        }
+      })();
+    });
 
     // 메모 지우기(×) 버튼.
     el.querySelector('#u-note-clear').addEventListener('click', () => {
